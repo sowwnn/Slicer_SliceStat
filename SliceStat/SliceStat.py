@@ -360,22 +360,11 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
         """
         Process a segmentation node and return segment results
         """
-        labelmapVolumeNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "TempLabelmap")
-
-        slicer.util.showStatusMessage("Exporting segmentation to labelmap...")
-        slicer.app.processEvents()  # Update GUI
-
-        if not slicer.vtkSlicerSegmentationsModuleLogic.ExportVisibleSegmentsToLabelmapNode(segmentationNode, labelmapVolumeNode, referenceVolumeNode):
-            slicer.mrmlScene.RemoveNode(labelmapVolumeNode)
-            raise RuntimeError("Failed to export segmentation to labelmap.")
-
-        # 2. Convert labelmap to NumPy array
+        # Do not rely on visibility-dependent merged labelmaps.
+        # Process each segment independently to avoid label value mismatches.
         slicer.util.showStatusMessage("Converting volume to array...")
         slicer.app.processEvents()  # Update GUI
 
-        volumeArray = slicer.util.arrayFromVolume(labelmapVolumeNode)
-
-        # 3. Get segments and iterate
         segmentation = segmentationNode.GetSegmentation()
         numberOfSegments = segmentation.GetNumberOfSegments()
         segmentResults = {}
@@ -383,21 +372,42 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
         for i in range(numberOfSegments):
             segment = segmentation.GetNthSegment(i)
             segmentName = segment.GetName()
-
-            # The labelmap value is the segment index + 1
-            segmentLabelValue = i + 1
+            segmentId = segmentation.GetNthSegmentID(i)
 
             slicer.util.showStatusMessage(f"Processing segment: {segmentName}...")
             slicer.app.processEvents()  # Update GUI
 
-            # Find slices where this segment exists by checking along the slice axis (axis 0)
-            slices_with_segment = np.any(volumeArray == segmentLabelValue, axis=(1, 2))
+            # Preferred: get binary labelmap array directly; fallback to single-segment export
+            binaryArray = None
+            try:
+                binaryArray = slicer.util.arrayFromSegmentBinaryLabelmap(segmentationNode, segmentId, referenceVolumeNode)
+            except Exception:
+                binaryArray = None
+
+            if binaryArray is None:
+                tempLabelmap = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "TempLabelmap_Single")
+                try:
+                    ids = vtk.vtkStringArray()
+                    ids.InsertNextValue(segmentId)
+                    ok = slicer.vtkSlicerSegmentationsModuleLogic.ExportSegmentsToLabelmapNode(
+                        segmentationNode,
+                        ids,
+                        tempLabelmap,
+                        referenceVolumeNode
+                    )
+                    if not ok:
+                        raise RuntimeError("Failed to export single segment to labelmap.")
+                    tempArray = slicer.util.arrayFromVolume(tempLabelmap)
+                    binaryArray = (tempArray > 0)
+                finally:
+                    slicer.mrmlScene.RemoveNode(tempLabelmap)
+
+            # Compute slice indices along axis 0 where any voxel is present
+            presence = (binaryArray > 0) if binaryArray.dtype != np.bool_ else binaryArray
+            slices_with_segment = np.any(presence, axis=(1, 2))
             slice_indices = np.where(slices_with_segment)[0]
 
             segmentResults[segmentName] = [int(idx) for idx in slice_indices]
-
-        # Clean up temporary nodes
-        slicer.mrmlScene.RemoveNode(labelmapVolumeNode)
 
         # Print results to Python console for immediate feedback
         print("\n--- Slice Statistics Results ---")
@@ -420,7 +430,7 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
             
             # Write header if not appending or if file doesn't exist
             if not file_exists:
-                writer.writerow(['ID', 'SegmentName', 'SliceNumbers'])
+                writer.writerow(['ID', 'SegmentName', 'SliceNumbers', 'SliceCount'])
             
             # Write data rows - only first row has ID, others have empty ID
             first_segment = True
@@ -437,7 +447,8 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
                     segmentId = ""
                 
                 sliceNumbersStr = ",".join(map(str, sliceNumbers)) if sliceNumbers else ""
-                writer.writerow([segmentId, segmentName, sliceNumbersStr])
+                sliceCount = len(sliceNumbers) if sliceNumbers else 0
+                writer.writerow([segmentId, segmentName, sliceNumbersStr, sliceCount])
 
     def run_export_all(self, segmentationNode, outputPath, appendMode=False):
         """
@@ -486,27 +497,32 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
             if not volumeBaseName:
                 volumeBaseName = volumeName
             
-            # Try to find matching segmentation (.seg.nrrd or .seg[final].nrrd)
+            # Try to find matching segmentation by prefix of the source base name
+            # Collect all candidates that start with the volumeBaseName (allow arbitrary suffix),
+            # prefer ones containing "(final)" in the name if multiple exist.
+            candidateSegNodes = []
+            finalPreferredSegNodes = []
             for segNode in segmentationNodes:
-                # Try to get file path from segmentation node
                 segStorageNode = segNode.GetStorageNode()
-                segFilePath = None
-                if segStorageNode:
-                    segFilePath = segStorageNode.GetFileName()
-                
-                if segFilePath:
-                    # Use file path for matching
-                    segFileName = os.path.basename(segFilePath)
-                    # Check for .seg.nrrd or (final).seg.nrrd patterns
-                    if segFileName.startswith(volumeBaseName + ' (final).seg') or segFileName.startswith(volumeBaseName + '.seg') or segFileName.startswith(volumeBaseName + '.seg.nrrd') or segFileName.startswith(volumeBaseName + ' (final).seg.nrrd'):
-                        matchingSegNode = segNode
-                        break
+                segIdentifier = None
+                if segStorageNode and segStorageNode.GetFileName():
+                    segIdentifier = os.path.basename(segStorageNode.GetFileName())
                 else:
-                    # Fallback: use node name for matching
-                    segName = segNode.GetName()
-                    if segName.startswith(volumeBaseName + '.seg') or segName.startswith(volumeBaseName + ' (final).seg') or segName.startswith(volumeBaseName + '.seg.nrrd') or segName.startswith(volumeBaseName + ' (final).seg.nrrd'):
-                        matchingSegNode = segNode
-                        break
+                    segIdentifier = segNode.GetName()
+
+                if not segIdentifier:
+                    continue
+
+                if segIdentifier.startswith(volumeBaseName):
+                    # Any suffix allowed (e.g., .seg.nrrd, _v2.seg.nrrd, (final).seg.nrrd, etc.)
+                    candidateSegNodes.append(segNode)
+                    if ' (final)' in segIdentifier:
+                        finalPreferredSegNodes.append(segNode)
+
+            if finalPreferredSegNodes:
+                matchingSegNode = finalPreferredSegNodes[0]
+            elif candidateSegNodes:
+                matchingSegNode = candidateSegNodes[0]
             
             if not matchingSegNode:
                 warnings.append(f"Volume '{volumeName}' has no matching segmentation")
@@ -557,7 +573,7 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
             
             # Write header if not appending or if file doesn't exist
             if not file_exists:
-                writer.writerow(['ID', 'SegmentName', 'SliceNumbers'])
+                writer.writerow(['ID', 'SegmentName', 'SliceNumbers', 'SliceCount'])
             
             # Write data rows for each volume
             for volumeId, segmentResults in allResults.items():
@@ -575,7 +591,8 @@ class SliceStatLogic(ScriptedLoadableModuleLogic):
                         segmentId = ""
                     
                     sliceNumbersStr = ",".join(map(str, sliceNumbers)) if sliceNumbers else ""
-                    writer.writerow([segmentId, segmentName, sliceNumbersStr])
+                    sliceCount = len(sliceNumbers) if sliceNumbers else 0
+                    writer.writerow([segmentId, segmentName, sliceNumbersStr, sliceCount])
 
     def getReferenceVolume(self, segmentationNode):
         """

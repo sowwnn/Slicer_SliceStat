@@ -20,6 +20,15 @@ This method allows you to use the module without building it into your 3D Slicer
 
 After restarting, you will find the **Slice Statistics** module in the module selection dropdown, under the **VsData** category.
 
+### Install from GitHub Release (.zip)
+
+If you prefer to download a packaged zip:
+
+1. Download the latest `SliceStat-<version>.zip` from the GitHub Releases page.
+2. Extract the zip to a folder.
+3. In 3D Slicer, add that extracted folder to `Additional module paths` as described above.
+4. Restart 3D Slicer.
+
 ## Usage
 
 1.  Load your source volume (e.g., CT, MRI) and the corresponding segmentation file into 3D Slicer.
